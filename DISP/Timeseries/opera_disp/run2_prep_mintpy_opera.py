@@ -60,9 +60,8 @@ from pst_dolphin_utils import (
     load_gdal,
     process_blocks,
     warp_to_match,
-    calculate_cumulative_displacement,
 )
-
+from pst_ts_utils import calculate_cumulative_displacement
 from tile_mate.stitcher import DATASET_SHORTNAMES
 
 OPERA_DATASET_ROOT = './'
@@ -71,17 +70,21 @@ OPERA_DATASET_ROOT = './'
 ####################################################################################
 EXAMPLE = """example:
 
-    run2_prep_mintpy_opera.py 
-        -m static_lyrs 
-        -u "products/*.nc" 
-        --geom-dir geometry 
-        -o mintpy_output 
-        --water-mask-file esa_world_cover_2021 
-        --dem-file glo_30 
-        --ref-lalo "29.692 -95.635" 
-        --apply-mask 
-    
+  prep_mintpy.py
+      -m pst_output/static_CSLCs/
+      -c "pst_output/dolphin_output/stitched_interferograms/*.zeroed.cor.tif"
+      -u "pst_output/dolphin_output/stitched_interferograms/*.unw.zeroed.tif"
+      --geom-dir pst_output/dolphin_output/stitched_interferograms/geometry
+      --ref-lalo '19.2485991551617 -155.32285148610057'
+      -o mintpy_output
+
 """  # noqa: E501
+
+# """
+# Scott TODO:
+# - UTM_ZONE, EPSG from the stitched IFG (it won't work to get a single GSLC burst)
+# - pixel size is wrong since we're taking range/azimuth size, instead of geocoded size
+# - HEIGHT: do we wanna try to get that from the saved orbit info?
 
 
 def _create_parser():
@@ -512,7 +515,6 @@ def save_stack(
     with h5py.File(fname, "a") as f:
         prog_bar = ptime.progressBar(maxValue=num_file)
         for i,file_inc in enumerate(file_list):
-            # read data using gdal
             # if <v0.8, recommended_mask layer does not exist
             # if v0.8 there is an empty mask bug
             # for both cases pass array of 1s
@@ -523,7 +525,7 @@ def save_stack(
                 data = np.ones_like(water_mask, dtype=np.byte)
             else:
                 # read data using gdal
-                data = load_gdal(file_inc, masked=True)           
+                data = load_gdal(file_inc, masked=True)
 
             # apply reference point, if not None
             if ref_y is not None and ref_x is not None:
@@ -535,9 +537,9 @@ def save_stack(
                 mask_thres = mask_dict[dict_key]
                 mask_data = load_gdal(mask_lyr)
                 if reflyr_name == 'recommended_mask':
-                     data[mask_data < mask_thres] = 0
+                    data[mask_data < mask_thres] = 0
                 else:
-                     data[mask_data < mask_thres] = np.nan                
+                    data[mask_data < mask_thres] = np.nan
 
             # also apply water mask
             data = data * water_mask
@@ -711,10 +713,17 @@ def prepare_timeseries(
             f["timeseries"][0] = np.zeros((rows, cols), dtype=np.float32)
             # Calculate cumulative displacement for each date
             for i, date in enumerate(date_list[1:], start=1):
-                displacement = calculate_cumulative_displacement(
-                    date, date_list, water_mask, mask_dict, lyr_path,
-                    rows, cols, ref_y, ref_x, G, phase2range,
-                    apply_tropo_correction, work_dir, median_height)
+                # Do not apply reference point to short wvl layer
+                if lyr == shortwvl_layer[0]:
+                    displacement = calculate_cumulative_displacement(
+                        date, date_list, water_mask, mask_dict, lyr_path,
+                        rows, cols, None, None, G, phase2range,
+                        apply_tropo_correction, work_dir, median_height)
+                else:
+                    displacement = calculate_cumulative_displacement(
+                        date, date_list, water_mask, mask_dict, lyr_path,
+                        rows, cols, ref_y, ref_x, G, phase2range,
+                        apply_tropo_correction, work_dir, median_height)
                 if displacement is not None:
                     # writing timeseries to the date
                     f["timeseries"][i] = displacement
@@ -730,8 +739,14 @@ def prepare_timeseries(
         mask_layers.extend(['connected_component_labels',
             'temporal_coherence', sp_coh_lyr_name])
 
+    # Water mask layers available for version >= 0.8
     if track_version >= Version('0.8') and mask_lyrs is True:
-            mask_layers.extend(['water_mask'])
+        mask_layers.extend(['water_mask'])
+
+    # Timeseries inversion residuals available for version >= 1.0
+    if track_version >= Version('1.0'):
+        mask_layers.extend(['timeseries_inversion_residuals'])
+        phase2range = -1 * float(meta["WAVELENGTH"]) / (4.0 * np.pi)
 
     # need to manually build recommended mask in <=0.7 products
     # if v0.8, manually build up recommended mask because it is blank
@@ -745,9 +760,15 @@ def prepare_timeseries(
     for lyr in mask_layers:
         lyr_fname = os.path.join(os.path.dirname(outfile), f'{lyr}.h5')
         lyr_paths = [i.replace(disp_lyr_name, lyr) for i in unw_files]
-        save_stack(lyr_fname, ds_name_dict, meta, lyr_paths,
-                   water_mask, date12_list, track_version, 1,
-                   mask_dict=mask_dict)
+        # need to convert TS inversion from radians
+        if lyr == 'timeseries_inversion_residuals':
+            save_stack(lyr_fname, ds_name_dict, meta, lyr_paths,
+                       water_mask, date12_list, track_version, phase2range,
+                       mask_dict=mask_dict)
+        else:
+            save_stack(lyr_fname, ds_name_dict, meta, lyr_paths,
+                       water_mask, date12_list, track_version, 1,
+                       mask_dict=mask_dict)
         all_outputs.append(lyr_fname)
 
     # apply epoch-based masking
@@ -1079,6 +1100,7 @@ def main(iargs=None):
         else:
             filtered_dict[prod_pair] = production_time
             filtered_files.append(i)
+
     product_files = filtered_files
     date12_list = _get_date_pairs(product_files)
     print(f"Found {len(product_files)} unwrapped files")
@@ -1273,7 +1295,6 @@ def main(iargs=None):
     # initiate dolphin file object
     writer = BackgroundRasterWriter(dolphin_vel_file,
         like_filename=dolphin_ref_tif)
-
 
     # run dolphin velocity fitting algorithm in blocks
     def read_and_fit(
